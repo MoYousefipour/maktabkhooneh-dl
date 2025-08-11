@@ -26,3 +26,13 @@ if __name__ == "__main__":
 
 
 ```
+
+# How to find sessionid
+
+To find Session id, sign in `maktabkhoone.org` then use `Inspect element -> Network` and reload your site. Click on first item that appears and under `cookie` section, you can find you `sessionid`. Copy all charecters include `sessionid=`. the set it to you system with code below.
+
+```terminal
+
+export MK_COOKIE="sessionid=your_session_id";
+
+```
