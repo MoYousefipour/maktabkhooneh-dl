@@ -3,7 +3,7 @@ COLOR = {
     "red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m", "cyan": "\033[36m"
 }
 
-def paint(code, s): 
+def paint(code, s):
     return f"{code}{s}{COLOR['reset']}"
 
 paintGreen = lambda s: paint(COLOR['green'], s)
