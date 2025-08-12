@@ -10,6 +10,7 @@ from .utils import sanitize_name, decode_html_entities, extract_slug, unquote
 
 class MaktabDownloader:
     ORIGIN = "https://maktabkhooneh.org"
+    FAILED_LOG_FILE = "failed_downloads.log"
 
     def __init__(self, cookie=None, max_concurrent=3, verbose=False):
         self.cookie = cookie or self._get_cookie_from_env()
@@ -21,6 +22,7 @@ class MaktabDownloader:
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.queue = asyncio.Queue()
         self.session = None
+        self.failed_tasks = []
 
     def _get_cookie_from_env(self):
         cookie = os.getenv("MK_COOKIE", "").strip()
@@ -96,7 +98,7 @@ class MaktabDownloader:
             Path(filepath).parent.mkdir(parents=True, exist_ok=True)
 
             progress = tqdm(total=total, unit="B", unit_scale=True,
-                            desc=Path(filepath).name, position=position, leave=True)
+                            desc=filepath.name, position=position, leave=True)
 
             with open(filepath, "wb") as f:
                 async for chunk in r.content.iter_chunked(1024):
@@ -108,27 +110,36 @@ class MaktabDownloader:
                         break
             progress.close()
 
-    async def download_worker(self, name, queue, position=0, sample_bytes=0):
+    async def download_worker(self, name, queue, sample_bytes=0, position=0):
         async with self.semaphore:
-            lec_url, filepath, referer = await queue.get()
-            try:
-                html = await self.fetch_lecture_html(lec_url)
-                videos = self.extract_video_sources(html)
-                if not videos:
-                    logWarn(f"[{name}] No video sources found for {filepath.name}")
-                    return
-                best_url = videos[0]
-                logInfo(f"[{name}] Downloading {filepath.name}")
-                await self.download_file(best_url, filepath, referer, sample_bytes, position)
-                logSuccess(f"[{name}] Downloaded {filepath.name}")
-            except Exception as e:
-                logError(f"[{name}] Failed {filepath.name}: {e}")
-            finally:
-                queue.task_done()
+            while True:
+                lec_url, filepath, referer, chapter_title = await queue.get()
+                try:
+                    if filepath.exists() and filepath.stat().st_size > 0:
+                        logInfo(f"[{name}] Skipping existing file {filepath.name}")
+                        queue.task_done()
+                        continue
+
+                    html = await self.fetch_lecture_html(lec_url)
+                    videos = self.extract_video_sources(html)
+                    if not videos:
+                        logWarn(f"[{name}] No video sources found for {filepath.name}")
+                        self.failed_tasks.append((lec_url, filepath, referer, chapter_title))
+                        queue.task_done()
+                        continue
+                    best_url = videos[0]
+                    logInfo(f"[{name}] Downloading {filepath.name}")
+                    await self.download_file(best_url, filepath, referer, sample_bytes, position)
+                    logSuccess(f"[{name}] Downloaded {filepath.name}")
+                except Exception as e:
+                    logError(f"[{name}] Failed {filepath.name}: {e}")
+                    self.failed_tasks.append((lec_url, filepath, referer, chapter_title))
+                finally:
+                    queue.task_done()
 
     async def worker_loop(self, name, queue, sample_bytes, position):
         while True:
-            await self.download_worker(name, queue, position, sample_bytes)
+            await self.download_worker(name, queue, sample_bytes, position)
 
     def print_profile_summary(self, core):
         is_auth = core.get("auth", {}).get("details", {}).get("is_authenticated", False)
@@ -156,21 +167,20 @@ class MaktabDownloader:
             chapters_data = await self.fetch_chapters(slug)
             chapters = chapters_data.get("chapters", [])
 
-            position_counter = 0
-
             for ch in chapters:
-                ch_title = ch.get("title") or ch.get("slug") or "chapter"
+                ch_title = sanitize_name(ch.get("title") or ch.get("slug") or "chapter")
                 units = ch.get("unit_set") or []
+                chapter_dir = out_dir / ch_title
+                chapter_dir.mkdir(parents=True, exist_ok=True)
                 for unit in units:
                     if not unit.get("status"):
                         continue
                     if unit.get("type") != "lecture":
                         continue
                     lec_url = f"{self.ORIGIN}/course/{slug}/{ch['slug']}-ch{ch['id']}/{unit['slug']}/"
-                    fname = sanitize_name(f"{ch_title} - {unit.get('title','lecture')}.mp4")
-                    fpath = out_dir / fname
-                    await self.queue.put( (lec_url, fpath, lec_url) )
-                    position_counter += 1
+                    fname = sanitize_name(f"{unit.get('title','lecture')}.mp4")
+                    fpath = chapter_dir / fname
+                    await self.queue.put((lec_url, fpath, lec_url, ch_title))
 
             workers = [
                 asyncio.create_task(
@@ -178,7 +188,24 @@ class MaktabDownloader:
                 ) for i in range(self.max_concurrent)
             ]
 
+            
             await self.queue.join()
+
+            retry_count = 0
+            max_retries = 3
+            while self.failed_tasks and retry_count < max_retries:
+                retry_count += 1
+                logWarn(f"Retrying failed downloads, attempt {retry_count}/{max_retries} ...")
+                for task in self.failed_tasks:
+                    await self.queue.put(task)
+                self.failed_tasks.clear()
+                await self.queue.join()
+
+            if self.failed_tasks:
+                logError("Some files failed to download after retries. See failed_downloads.log")
+                with open(self.FAILED_LOG_FILE, "w", encoding="utf-8") as f:
+                    for lec_url, filepath, _, ch_title in self.failed_tasks:
+                        f.write(f"{lec_url}\t{filepath}\t{ch_title}\n")
 
             for w in workers:
                 w.cancel()
