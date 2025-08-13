@@ -12,14 +12,14 @@ class MaktabDownloader:
     ORIGIN = "https://maktabkhooneh.org"
     FAILED_LOG_FILE = "failed_downloads.log"
 
-    def __init__(self, cookie=None, max_concurrent=3, verbose=False):
+    def __init__(self, cookie=None, verbose=False):
         self.cookie = cookie or self._get_cookie_from_env()
         if self.cookie == "PUT_YOUR_COOKIE_HERE":
             raise MaktabDownloaderError("Cookie is not set. Set MK_COOKIE or MK_COOKIE_FILE environment variable.")
-        self.max_concurrent = max_concurrent
+        self.max_concurrent = 1
         self.verbose = verbose
 
-        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.semaphore = asyncio.Semaphore(1)
         self.queue = asyncio.Queue()
         self.session = None
         self.failed_tasks = []
@@ -131,12 +131,11 @@ class MaktabDownloader:
                     logInfo(f"[{name}] Downloading {filepath.name}")
                     await self.download_file(best_url, filepath, referer, sample_bytes, position)
                     logSuccess(f"[{name}] Downloaded {filepath.name}")
+                    queue.task_done()
+                    continue
                 except Exception as e:
                     logError(f"[{name}] Failed {filepath.name}: {e}")
                     self.failed_tasks.append((lec_url, filepath, referer, chapter_title))
-                finally:
-                    queue.task_done()
-
     async def worker_loop(self, name, queue, sample_bytes, position):
         while True:
             await self.download_worker(name, queue, sample_bytes, position)
@@ -187,12 +186,11 @@ class MaktabDownloader:
                     self.worker_loop(f"Worker-{i+1}", self.queue, sample_bytes, i)
                 ) for i in range(self.max_concurrent)
             ]
-
             
             await self.queue.join()
 
             retry_count = 0
-            max_retries = 3
+            max_retries = 3      
             while self.failed_tasks and retry_count < max_retries:
                 retry_count += 1
                 logWarn(f"Retrying failed downloads, attempt {retry_count}/{max_retries} ...")
